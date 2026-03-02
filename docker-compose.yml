@@ -1,0 +1,31 @@
+services:
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./custom_callbacks.py:/app/custom_callbacks.py
+      - ./artifacts:/app/artifacts
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PYTHONPATH: /app
+      ROUTER_METRICS_PATH: /app/artifacts/router_metrics.jsonl
+    command: ["--config", "/app/config.yaml", "--detailed_debug"]
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+

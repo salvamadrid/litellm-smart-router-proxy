@@ -1,0 +1,42 @@
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  # Allow clients to use multiple aliases for the router.
+  model_alias_map:
+    auto_router/complexity_router: smart-router
+    complexity_router: smart-router
+  drop_params: true
+  callbacks:
+    - custom_callbacks.proxy_handler_instance
+
+model_list:
+  - model_name: gpt-5-nano
+    litellm_params:
+      model: gpt-5-nano
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-5-mini
+    litellm_params:
+      model: gpt-5-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-5
+    litellm_params:
+      model: gpt-5
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-5.1
+    litellm_params:
+      model: gpt-5.1
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Proxy-only alias. Requests sent to "smart-router" will be rewritten by the callback.
+  - model_name: smart-router
+    litellm_params:
+      model: gpt-5-mini
+    model_info:
+      key: smart-router
+      litellm_provider: openai
+      mode: chat
+

@@ -1,0 +1,25 @@
+.env
+.env.*
+!.env.example
+
+# Artifacts / metrics
+artifacts/
+
+# Local databases / state
+litellm.db
+*.sqlite
+*.sqlite3
+
+# Postgres volumes (if created locally)
+postgres_data
+postgres_data_native
+
+# OS/editor noise
+.DS_Store
+.vscode/
+
+# Python noise
+__pycache__/
+*.pyc
+*.pyo
+
