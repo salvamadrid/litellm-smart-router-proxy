@@ -54,7 +54,8 @@ class ProxySanitizer(CustomLogger):
 
     _repo_edit_markers = re.compile(
         r"\b(makefile|readme\.md|docker(-|\s*)compose|git\s+(diff|status|commit)|patch|diffstat|"
-        r"edit|modify|update|insert|str_replace|file_editor|terminal)\b",
+        r"edit|modify|update|insert|str_replace|file_editor|terminal|skill|skills|skill\.md|"
+        r"read\s+tool|read\s+file|offset|limit)\b",
         re.IGNORECASE,
     )
 
@@ -68,6 +69,7 @@ class ProxySanitizer(CustomLogger):
             "Tool-calling requirement (critical): when you call ANY tool (e.g. terminal, file_editor, "
             "str_replace_editor), ALWAYS include the required argument security_risk with value \"low\" "
             "unless explicitly higher.\n"
+            "- For file Read tool calls, always pass offset >= 0 and limit >= 1 (use limit=2000 by default).\n"
             "- Prefer minimal, targeted edits.\n"
         ),
     }
@@ -109,16 +111,40 @@ class ProxySanitizer(CustomLogger):
     def _extract_user_text(self, messages: Iterable[dict]) -> str:
         parts: list[str] = []
         for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
             if isinstance(content, list):
                 for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
+                    if not isinstance(item, dict):
+                        parts.append(str(item))
+                        continue
+                    if item.get("type") in {"text", "input_text", "output_text"}:
+                        parts.append(str(item.get("text", "")))
+                    elif "text" in item:
                         parts.append(str(item.get("text", "")))
             else:
                 parts.append(str(content))
         return "\n".join(p for p in parts if p)
+
+    def _responses_hint_item(self) -> dict:
+        return {
+            "role": self._tool_schema_hint["role"],
+            "content": [{"type": "input_text", "text": self._tool_schema_hint["content"]}],
+        }
+
+    def _content_contains_hint(self, content: object) -> bool:
+        if isinstance(content, str):
+            return self._tool_schema_hint["content"] == content
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("text", "")) == self._tool_schema_hint["content"]:
+                    return True
+        return False
 
     def _normalize_responses_input_text_types(self, data: dict) -> None:
         """
@@ -293,10 +319,12 @@ class ProxySanitizer(CustomLogger):
     def _extract_tag_text(self, messages: Iterable[dict]) -> str:
         parts: list[str] = []
         for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
             content = msg.get("content", "")
             if isinstance(content, list):
                 for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
+                    if isinstance(item, dict) and item.get("type") in {"text", "input_text", "output_text"}:
                         parts.append(str(item.get("text", "")))
                     else:
                         parts.append(str(item))
@@ -355,7 +383,13 @@ class ProxySanitizer(CustomLogger):
         data["model"] = self._normalize_router_model_name(data.get("model"))
 
         messages = data.get("messages", [])
-        tag_text = self._extract_tag_text(messages if isinstance(messages, list) else [])
+        responses_input = data.get("input", [])
+        tag_text_parts: list[str] = []
+        if isinstance(messages, list):
+            tag_text_parts.append(self._extract_tag_text(messages))
+        if isinstance(responses_input, list):
+            tag_text_parts.append(self._extract_tag_text(responses_input))
+        tag_text = "\n".join(p for p in tag_text_parts if p)
         metadata = data.get("metadata") or {}
         if original_model:
             metadata["requested_model"] = str(original_model)
@@ -378,11 +412,21 @@ class ProxySanitizer(CustomLogger):
         if data.get("model") == "smart-router":
             messages = data.get("messages")
             if isinstance(messages, list) and (
-                not messages or messages[0].get("content") != self._tool_schema_hint["content"]
+                not messages or not self._content_contains_hint(messages[0].get("content"))
             ):
                 data["messages"] = [self._tool_schema_hint, *messages]
+            else:
+                responses_input = data.get("input")
+                if isinstance(responses_input, list) and (
+                    not responses_input or not self._content_contains_hint(responses_input[0].get("content"))
+                ):
+                    data["input"] = [self._responses_hint_item(), *responses_input]
 
-            user_text = self._extract_user_text(data.get("messages", []))
+            user_text = ""
+            if isinstance(data.get("messages"), list):
+                user_text = self._extract_user_text(data.get("messages", []))
+            if not user_text and isinstance(data.get("input"), list):
+                user_text = self._extract_user_text(data.get("input", []))
             score = self._complexity_score(user_text)
             tier = self._pick_tier(score)
             selected_model = self._tier_models[tier]
@@ -402,14 +446,24 @@ class ProxySanitizer(CustomLogger):
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):  # noqa: N802
         try:
-            metadata = (kwargs or {}).get("metadata") or {}
+            litellm_params = ((kwargs or {}).get("litellm_params") or {})
+            metadata = (kwargs or {}).get("metadata") or litellm_params.get("metadata") or {}
             messages = (kwargs or {}).get("messages")
             if not messages:
-                messages = ((kwargs or {}).get("litellm_params") or {}).get("messages")
+                messages = litellm_params.get("messages")
             if not messages:
                 messages = []
 
-            tag_text = self._extract_tag_text(messages if isinstance(messages, list) else [])
+            responses_input = (kwargs or {}).get("input")
+            if not responses_input:
+                responses_input = litellm_params.get("input")
+
+            tag_text_parts: list[str] = []
+            if isinstance(messages, list):
+                tag_text_parts.append(self._extract_tag_text(messages))
+            if isinstance(responses_input, list):
+                tag_text_parts.append(self._extract_tag_text(responses_input))
+            tag_text = "\n".join(p for p in tag_text_parts if p)
             for extra_key in ("input", "prompt", "user_message"):
                 extra_val = (kwargs or {}).get(extra_key)
                 if extra_val:
@@ -504,4 +558,3 @@ class ProxySanitizer(CustomLogger):
 
 
 proxy_handler_instance = ProxySanitizer()
-
