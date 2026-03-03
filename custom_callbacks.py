@@ -120,6 +120,176 @@ class ProxySanitizer(CustomLogger):
                 parts.append(str(content))
         return "\n".join(p for p in parts if p)
 
+    def _normalize_responses_input_text_types(self, data: dict) -> None:
+        """
+        OpenAI Responses API expects different content types by role:
+        - user/system/developer -> input_text
+        - assistant -> output_text
+
+        Some clients send generic type='text' blocks in `input`, which causes
+        invalid value errors on follow-up turns.
+        """
+        payload = data.get("input")
+        if not isinstance(payload, list):
+            return
+
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).lower()
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and "text" in block:
+                    if role == "assistant":
+                        block["type"] = "output_text"
+                    else:
+                        block["type"] = "input_text"
+
+    def _normalize_responses_tools(self, data: dict) -> None:
+        """
+        Normalize Chat Completions style function tools to Responses API style.
+
+        Chat style:
+          {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+        Responses style:
+          {"type":"function","name":"...","description":"...","parameters":{...}}
+        """
+        tools = data.get("tools")
+        if not isinstance(tools, list):
+            return
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") != "function":
+                continue
+            if tool.get("name"):
+                continue
+
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                continue
+
+            if fn.get("name"):
+                tool["name"] = fn.get("name")
+            if "description" not in tool and "description" in fn:
+                tool["description"] = fn.get("description")
+            if "parameters" not in tool and "parameters" in fn:
+                tool["parameters"] = fn.get("parameters")
+            if "strict" not in tool and "strict" in fn:
+                tool["strict"] = fn.get("strict")
+
+    def _normalize_stream_options(self, data: dict) -> None:
+        """
+        Some clients send stream_options.include_usage, which certain OpenAI paths reject.
+        Remove only the unsupported key and keep the rest of stream_options.
+        """
+        stream_options = data.get("stream_options")
+        if not isinstance(stream_options, dict):
+            return
+
+        if "include_usage" in stream_options:
+            stream_options.pop("include_usage", None)
+        if not stream_options:
+            data.pop("stream_options", None)
+
+    def _normalize_agent_history_items(self, data: dict) -> None:
+        """
+        Normalize Chat-style tool history in Responses API `input`.
+
+        Cursor Agent can send:
+        - assistant messages with `tool_calls`
+        - tool role messages with `tool_call_id`
+
+        OpenAI Responses rejects `input[*].tool_calls`, so we:
+        1) strip `tool_calls` / `function_call` from role messages
+        2) emit explicit `function_call` / `function_call_output` items
+        """
+        payload = data.get("input")
+        if not isinstance(payload, list):
+            return
+
+        normalized_input = []
+        for item in payload:
+            if not isinstance(item, dict):
+                normalized_input.append(item)
+                continue
+
+            role = str(item.get("role", "")).lower()
+
+            # Convert chat "tool" messages to responses function_call_output items.
+            if role == "tool":
+                call_id = item.get("tool_call_id") or item.get("id") or "call_unknown"
+                raw_output = item.get("content", "")
+                if isinstance(raw_output, (dict, list)):
+                    output_text = json.dumps(raw_output, ensure_ascii=False)
+                else:
+                    output_text = str(raw_output)
+                normalized_input.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(call_id),
+                        "output": output_text,
+                    }
+                )
+                continue
+
+            # Keep a cleaned role-message version.
+            cleaned_item = dict(item)
+            tool_calls = cleaned_item.pop("tool_calls", None)
+            legacy_function_call = cleaned_item.pop("function_call", None)
+            normalized_input.append(cleaned_item)
+
+            # Convert assistant tool_calls to Responses function_call items.
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    fn = tool_call.get("function") or {}
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name")
+                    arguments = fn.get("arguments")
+                    call_id = tool_call.get("id") or tool_call.get("call_id")
+                    if not name:
+                        continue
+                    if arguments is None:
+                        arguments = "{}"
+                    elif not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    normalized_input.append(
+                        {
+                            "type": "function_call",
+                            "call_id": str(call_id or f"call_{name}"),
+                            "name": str(name),
+                            "arguments": arguments,
+                        }
+                    )
+
+            # Convert legacy single function_call shape.
+            if isinstance(legacy_function_call, dict):
+                name = legacy_function_call.get("name")
+                arguments = legacy_function_call.get("arguments")
+                if name:
+                    if arguments is None:
+                        arguments = "{}"
+                    elif not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    normalized_input.append(
+                        {
+                            "type": "function_call",
+                            "call_id": f"call_{name}",
+                            "name": str(name),
+                            "arguments": arguments,
+                        }
+                    )
+
+        data["input"] = normalized_input
+
     def _extract_tag_text(self, messages: Iterable[dict]) -> str:
         parts: list[str] = []
         for msg in messages or []:
@@ -172,6 +342,12 @@ class ProxySanitizer(CustomLogger):
         data: dict,
         call_type: CallTypesLiteral,
     ):
+        # Normalize known client payload mismatches for OpenAI Responses API.
+        self._normalize_agent_history_items(data)
+        self._normalize_responses_input_text_types(data)
+        self._normalize_responses_tools(data)
+        self._normalize_stream_options(data)
+
         original_model = data.get("model")
         if "custom_llm_provider" in data:
             data.pop("custom_llm_provider", None)
